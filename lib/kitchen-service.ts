@@ -1,0 +1,56 @@
+import {validateInput,buildShoppingList,planConsumption,parseReceipt,recipeSchema} from './kitchen.ts';
+import type {Recipe,Stock,ShoppingList,KitchenState,ImportRecord} from './kitchen.ts';
+import {legacyMethodHtml,legacyNotesHtml} from './recipe-html.ts';
+import {KitchenError,fetchRecipe} from './kitchen-security.ts';
+type Row={id:string;kind:string;data:string};
+export async function readKitchen(db:D1Database,owner:string){
+ const [meta,rows]=await db.batch([db.prepare('SELECT revision FROM kitchen_meta WHERE owner = ?').bind(owner),db.prepare('SELECT id,kind,data FROM kitchen_records WHERE owner = ? ORDER BY updated_at DESC LIMIT 3001').bind(owner)]);
+ if(rows.results.length>3000)throw new KitchenError('Your kitchen has reached its record limit. Remove old imports or completed lists.',409);
+ const records=(rows.results as unknown as Row[]).map(r=>({kind:r.kind,item:JSON.parse(r.data)}));
+ return {revision:Number((meta.results[0] as {revision?:number}|undefined)?.revision||0),records,state:{recipes:records.filter(r=>r.kind==='recipe').map(r=>r.item),stock:records.filter(r=>r.kind==='stock').map(r=>r.item),lists:records.filter(r=>r.kind==='list').map(r=>r.item),imports:records.filter(r=>r.kind==='import').map(r=>r.item)} as KitchenState};
+}
+async function fingerprint(action:string,a:unknown){return [...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(JSON.stringify([action,a]))))].map(v=>v.toString(16).padStart(2,'0')).join('');}
+export async function dispatch(db:D1Database,owner:string,action:string,input:unknown,channel:'website'|'chat'='website'):Promise<any>{
+ if(!owner)throw new KitchenError('Sign in with ChatGPT.',401);
+ const a=validateInput(action,input);const op=a.operationId;const hash=op?await fingerprint(action,action==='save_recipe'||action==='stage_import'?input:a):'';
+ const previous=op?await db.prepare('SELECT fingerprint,result FROM kitchen_operations WHERE owner = ? AND id = ?').bind(owner,op).first<{fingerprint:string;result:string}>():null;
+ if(previous){if(previous.fingerprint!==hash)throw new KitchenError('This operation ID was already used for a different change.',409);return JSON.parse(previous.result);}
+ const snapshot=await readKitchen(db,owner);const {state,records}=snapshot;
+ if(action==='get_kitchen')return state;
+ let additions=0;const reserve=()=>{if(records.length+(++additions)>3000)throw new KitchenError('Your kitchen is full. Remove old imports or completed lists.',409);};const statements:D1PreparedStatement[]=[];const now=new Date().toISOString();let result:any={ok:true};
+ const find=(kind:string,id:string,revision?:number)=>{const r=records.find(r=>r.kind===kind&&r.item.id===id)?.item;if(!r)throw new KitchenError('This record no longer exists. Refresh your kitchen.',404);if(revision!==undefined&&r.revision!==revision)throw new KitchenError('This record changed elsewhere. Refresh before saving.',409);return r;};
+ const resolveImage=(item:any,existing:any)=>{const result={...item};for(const field of ['imageUrl','imageAlt','imageCredit','attachmentId'])if(result[field]===undefined&&existing?.[field]!==undefined)result[field]=existing[field];if(result.attachmentId){const attachment=find('attachment',result.attachmentId);if(!attachment.type?.startsWith('image/'))throw new KitchenError('Choose an image attachment.');}return result;};
+ const resolveRecipe=(raw:any,existing:any)=>{const next={...raw};if(existing)for(const [field,html] of [['method','methodHtml'],['notes','notesHtml']]){if(raw[field]===undefined)next[field]=existing[field];if(raw[html]===undefined||raw[html]===existing[html]){if(JSON.stringify(next[field])!==JSON.stringify(existing[field]))next[html]=field==='method'?legacyMethodHtml(next[field]||[]):legacyNotesHtml(next[field]||'');else if(existing[html]!==undefined)next[html]=existing[html];}}return recipeSchema.parse(resolveImage(next,existing));};
+ const save=(kind:string,item:any)=>{const existing=item.id?find(kind,item.id,item.revision):null;if(!existing)reserve();const saved={...item,id:item.id||crypto.randomUUID(),revision:(existing?.revision||0)+1,updatedAt:now};statements.push(db.prepare('INSERT INTO kitchen_records (owner,id,kind,data,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(owner,id) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at').bind(owner,saved.id,kind,JSON.stringify(saved),now));return saved;};
+ // Only explicit chat additions bypass review. Existing website drafts retain their review gate.
+ const storeImport=(draft:any,direct:boolean)=>{
+  const ready=!!draft.recipe||!!draft.items?.length;
+  if(direct&&ready&&!/^Needs review:/i.test(draft.text?.trim()||'')){
+   if(draft.recipe){const recipe=validateInput('save_recipe',{operationId:op,item:{...draft.recipe,id:undefined,revision:0}}).item;save('recipe',{...resolveImage({...recipe,attachmentId:recipe.attachmentId||draft.attachmentId},null),original:draft.recipe.original||recipe});}
+   for(const i of draft.items||[]){const item=validateInput('save_stock',{operationId:op,item:{...i,attachmentId:i.attachmentId||draft.attachmentId,id:undefined,revision:0}}).item;save('stock',resolveImage(item,null));}
+   return save('import',{...draft,status:'approved'});
+  }
+  return save('import',{...draft,status:'pending'});
+ };
+ switch(action){
+ case 'save_recipe':{const existing=a.item.id?find('recipe',a.item.id,a.item.revision):null;a.item=resolveRecipe((input as any).item,existing);result=save('recipe',{...a.item,original:existing?.original||{title:a.item.title,servings:a.item.servings,ingredients:a.item.ingredients,method:a.item.method,methodHtml:a.item.methodHtml,notes:a.item.notes,notesHtml:a.item.notesHtml,sourceUrl:a.item.sourceUrl}});break;}
+ case 'save_stock':result=save('stock',resolveImage(a.item,a.item.id?find('stock',a.item.id,a.item.revision):null));break;
+ case 'save_upload':{reserve();const serialized=JSON.stringify({id:a.attachmentId,name:a.name,type:a.type,key:owner+'/'+a.attachmentId,size:a.size,contentHash:a.contentHash,revision:1});statements.push(db.prepare('INSERT INTO kitchen_records (owner,id,kind,data,updated_at) VALUES (?,?,?,?,?)').bind(owner,a.attachmentId,'attachment',serialized,now));result=save('import',{sourceFileId:a.sourceFileId,title:a.name,source:a.type==='text/plain'?'Email receipt':'Photo',attachmentId:a.attachmentId,attachmentType:a.type,text:a.text,items:[],status:'pending',createdAt:now});break;}
+ case 'delete_record':{const current=find(a.kind,a.id,a.revision);statements.push(db.prepare('DELETE FROM kitchen_records WHERE owner = ? AND id = ? AND kind = ?').bind(owner,a.id,a.kind));if(a.kind==='import'&&current.attachmentId&&!records.some(r=>r.item.id!==current.id&&r.item.attachmentId===current.attachmentId)){const attachment=records.find(r=>r.kind==='attachment'&&r.item.id===current.attachmentId)?.item;if(attachment){statements.push(db.prepare('DELETE FROM kitchen_records WHERE owner = ? AND id = ? AND kind = ?').bind(owner,attachment.id,'attachment'));result={ok:true,cleanupKeys:[attachment.key]};}}break;}
+ case 'create_shopping_list':{const selections=a.selections.map((s:{id:string;servings:number})=>({recipe:find('recipe',s.id) as Recipe,servings:s.servings}));result=save('list',{title:a.title,items:buildShoppingList(selections,state.stock).map(i=>({...i,id:crypto.randomUUID()})),recipes:a.selections,completed:false});break;}
+ case 'save_shopping_list':{const current=a.item.id?find('list',a.item.id,a.item.revision):null;result=save('list',{...a.item,completed:current?.completed||false});break;}
+ case 'stage_import':{const existing=a.id?find('import',a.id,a.revision):null;if(existing?.status==='approved')throw new KitchenError('This import has already been approved.',409);if(a.attachmentId)find('attachment',a.attachmentId);if(a.recipe)a.recipe=resolveRecipe((input as any).recipe,existing?.recipe);const draftRecipe=a.recipe?{...a.recipe,original:existing?.recipe?.original||{...a.recipe}}:undefined;result=storeImport({...existing,...a,recipe:draftRecipe,operationId:undefined,createdAt:existing?.createdAt||now},channel==='chat'&&(!existing||!!existing.sourceFileId));break;}
+ case 'parse_receipt':result=storeImport({title:a.title,source:a.source,text:a.text,items:parseReceipt(a.text),createdAt:now},channel==='chat');break;
+ case 'import_recipe_url':{const r=await fetchRecipe(a.url);const parsed=recipeSchema.parse(r);result=storeImport({title:r.title,source:'Recipe link',text:'',items:[],recipe:{...parsed,original:{...parsed,sourceText:r.original}},createdAt:now},channel==='chat');break;}
+ case 'approve_import':{const im=find('import',a.id,a.revision) as ImportRecord;if(im.status==='approved')throw new KitchenError('This import was already approved.',409);if(!im.recipe&&!im.items.length)throw new KitchenError('Extract or enter the contents before approving.');if(im.recipe){const recipe=validateInput('save_recipe',{operationId:op,item:{...im.recipe,id:undefined,revision:0}}).item;save('recipe',{...resolveImage({...recipe,attachmentId:recipe.attachmentId||im.attachmentId},null),original:(im.recipe as any).original||recipe});}for(const i of im.items){const item=validateInput('save_stock',{operationId:op,item:{...i,id:undefined,revision:0}}).item;save('stock',resolveImage(item,null));}result=save('import',{...im,status:'approved'});break;}
+ case 'complete_shopping':{const list=find('list',a.id,a.revision) as ShoppingList;if(list.completed)throw new KitchenError('These purchases were already added.',409);if(!a.items.length||!list.items.some(i=>i.checked))throw new KitchenError('Select and review purchased items first.');for(const i of a.items)save('stock',i);const remaining=list.items.filter(i=>!i.checked);result=save('list',{...list,items:remaining.length?remaining:list.items,completed:remaining.length===0});break;}
+ case 'record_cook':{const recipe=find('recipe',a.recipeId) as Recipe;const plan=planConsumption(recipe,a.servings,state.stock);if(plan.missing.length&&!a.confirmMissing)return {needsConfirmation:true,missing:plan.missing};for(const s of plan.changes)save('stock',s);result={ok:true,missing:plan.missing,deducted:plan.changes.length};break;}
+ case 'get_import_attachment':{return find('attachment',a.id);}
+ default:throw new KitchenError('Unknown action.');
+ }
+ if(!op)throw new KitchenError('A unique operation ID is required.');
+ const lock=db.prepare('INSERT INTO kitchen_meta (owner,revision) VALUES (?,1) ON CONFLICT(owner) DO UPDATE SET revision=CASE WHEN kitchen_meta.revision = ? THEN kitchen_meta.revision + 1 ELSE -1 END').bind(owner,snapshot.revision);
+ const receipt=db.prepare('INSERT INTO kitchen_operations (owner,id,fingerprint,result,created_at) VALUES (?,?,?,?,?)').bind(owner,op,hash,JSON.stringify(result),now);
+ try{await db.batch([lock,...statements,receipt]);}catch{const raced=await db.prepare('SELECT fingerprint,result FROM kitchen_operations WHERE owner = ? AND id = ?').bind(owner,op).first<{fingerprint:string;result:string}>();if(raced&&raced.fingerprint===hash)return JSON.parse(raced.result);throw new KitchenError('Your kitchen changed while saving. Refresh and try again.',409);}
+ return result;
+}

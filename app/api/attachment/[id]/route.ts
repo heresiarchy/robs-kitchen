@@ -1,0 +1,3 @@
+import {env} from 'cloudflare:workers';import {dispatch} from '@/lib/kitchen-service';import {requestOwner,errorResponse,KitchenError} from '@/lib/kitchen-security';
+export const dynamic='force-dynamic';
+export async function GET(request:Request,{params}:{params:Promise<{id:string}>}){try{const a=await dispatch(env.DB!,requestOwner(request),'get_import_attachment',{id:(await params).id});const object=await env.BUCKET!.get(a.key);if(!object)throw new KitchenError('Attachment not found.',404);return new Response(object.body,{headers:{'Content-Type':a.type,'Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff','Content-Security-Policy':"default-src 'none'; sandbox"}});}catch(e){return errorResponse(e);}}

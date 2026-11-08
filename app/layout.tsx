@@ -1,0 +1,3 @@
+import type {Metadata} from 'next';import './globals.css';
+export const metadata:Metadata={title:'Rob’s Kitchen · Recipes, pantry & shopping',description:'Your recipes, your pantry, a little less waste. A private kitchen companion connected to ChatGPT.',icons:{icon:[{url:'/favicon.ico',sizes:'any'},{url:'/favicon-32.png',type:'image/png',sizes:'32x32'},{url:'/favicon-192.png',type:'image/png',sizes:'192x192'}],shortcut:'/favicon.ico',apple:'/apple-touch-icon.png'}};
+export default function RootLayout({children}:{children:React.ReactNode}){return <html lang="en-GB"><head><link rel="manifest" href="/manifest.webmanifest" crossOrigin="use-credentials" /></head><body>{children}</body></html>;}
